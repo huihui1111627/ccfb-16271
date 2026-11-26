@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>确定性聚合执行器 — 浮点非确定性复现与治理</title>
+<style>
+  :root {
+    --bg: #0f141b; --panel: #171e28; --panel2: #1e2733; --line: #2a3645;
+    --txt: #d7e0ea; --muted: #8595a7; --accent: #4da3ff; --ok: #38d39f;
+    --warn: #ffb454; --bad: #ff6b6b; --purple: #b48cff;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+    font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",Segoe UI,sans-serif; }
+  header { padding:20px 28px 14px; border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,#141c27,#0f141b); }
+  header h1 { margin:0 0 4px; font-size:20px; }
+  header p { margin:0; color:var(--muted); font-size:13px; }
+  .wrap { display:grid; grid-template-columns:320px 1fr; gap:18px; padding:18px 28px; }
+  .panel { background:var(--panel); border:1px solid var(--line);
+    border-radius:10px; padding:16px; }
+  .panel h2 { margin:0 0 12px; font-size:14px; color:var(--accent);
+    text-transform:uppercase; letter-spacing:.06em; }
+  label { display:block; margin:10px 0 4px; color:var(--muted); font-size:12px; }
+  select, input[type=number] { width:100%; background:var(--panel2);
+    color:var(--txt); border:1px solid var(--line); border-radius:7px;
+    padding:8px 10px; font-size:13px; }
+  .radio-list { max-height:230px; overflow:auto; border:1px solid var(--line);
+    border-radius:7px; padding:6px; background:var(--panel2); }
+  .radio-list label { display:flex; gap:8px; align-items:flex-start;
+    margin:2px 0; color:var(--txt); font-size:12.5px; cursor:pointer; padding:3px 4px;
+    border-radius:5px; }
+  .radio-list label:hover { background:#243040; }
+  .radio-list input { margin-top:3px; }
+  .tag { font-size:10.5px; padding:1px 6px; border-radius:10px; white-space:nowrap; }
+  .tag.exact { background:rgba(56,211,159,.15); color:var(--ok); }
+  .tag.det { background:rgba(77,163,255,.15); color:var(--accent); }
+  .tag.flaky { background:rgba(255,107,107,.15); color:var(--bad); }
+  button { background:var(--accent); color:#08111d; border:0; border-radius:8px;
+    padding:10px 16px; font-weight:600; cursor:pointer; width:100%; margin-top:14px;
+    font-size:14px; }
+  button:hover { filter:brightness(1.1); }
+  button.secondary { background:var(--panel2); color:var(--txt);
+    border:1px solid var(--line); }
+  .check { display:flex; gap:8px; align-items:center; margin-top:10px; color:var(--muted); }
+  .check input { width:auto; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .kpi { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:14px; }
+  .kpi .card { background:var(--panel2); border:1px solid var(--line);
+    border-radius:9px; padding:12px 14px; }
+  .kpi .v { font-size:22px; font-weight:700; }
+  .kpi .k { color:var(--muted); font-size:11.5px; margin-top:2px; }
+  .v.ok { color:var(--ok); } .v.bad { color:var(--bad); } .v.warn { color:var(--warn); }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th,td { padding:7px 9px; border-bottom:1px solid var(--line); text-align:right; }
+  th:first-child,td:first-child { text-align:left; }
+  th { color:var(--muted); font-weight:600; font-size:11.5px; }
+  tr:hover td { background:#1b2531; }
+  .mono { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+  .note { color:var(--muted); font-size:12px; margin-top:8px; }
+  .err { background:rgba(255,107,107,.08); border:1px solid rgba(255,107,107,.35);
+    border-radius:8px; padding:10px 12px; color:#ffb0b0; font-size:12.5px;
+    margin-top:10px; max-height:180px; overflow:auto; }
+  .okbox { background:rgba(56,211,159,.08); border:1px solid rgba(56,211,159,.35);
+    border-radius:8px; padding:10px 12px; color:#9ff0d4; font-size:12.5px; margin-top:10px; }
+  canvas { width:100%; background:var(--panel2); border:1px solid var(--line);
+    border-radius:8px; }
+  .truth { background:var(--panel2); border:1px solid var(--line); border-radius:8px;
+    padding:10px 12px; font-size:12px; overflow-x:auto; }
+  .truth b { color:var(--purple); }
+  .tabs { display:flex; gap:8px; margin-bottom:14px; }
+  .tabs button { width:auto; margin:0; background:var(--panel2); color:var(--muted);
+    border:1px solid var(--line); }
+  .tabs button.active { background:var(--accent); color:#08111d; border-color:var(--accent); }
+  .hidden { display:none; }
+  .method-meta { font-size:11.5px; color:var(--muted); margin-top:6px;
+    border-top:1px dashed var(--line); padding-top:8px; }
+  .method-meta div { margin:3px 0; }
+  #spin { color:var(--warn); font-size:12.5px; margin-top:8px; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>确定性聚合执行器 <span style="color:var(--muted);font-weight:400;font-size:13px;">
+    并行浮点求和/方差的非确定性复现 · 顺序无关方案 · 成本对照</span></h1>
+  <p>同一批数据，每次随机切分区、随机合并顺序跑数百次：朴素浮点末位跳动触发对账告警；
+    定点/fsum/Decimal 方案逐位相同。真值由 60 位精度 Decimal 直接计算。</p>
+</header>
+
+<div class="wrap">
+  <!-- 控制面板 -->
+  <div class="panel" id="controls">
+    <h2>试验配置</h2>
+
+    <label>数据集</label>
+    <select id="dataset"></select>
+    <div class="note" id="ds-note"></div>
+
+    <label>聚合类型</label>
+    <select id="kind">
+      <option value="sum">求和 SUM</option>
+      <option value="variance">方差 VARIANCE（标准差同源）</option>
+    </select>
+
+    <label>聚合方法</label>
+    <div class="radio-list" id="methods"></div>
+    <div class="method-meta" id="method-meta"></div>
+
+    <div class="grid2" style="margin-top:10px">
+      <div>
+        <label>随机顺序次数</label>
+        <input type="number" id="trials" value="300" min="10" max="2000" step="50">
+      </div>
+      <div>
+        <label>最大分区数</label>
+        <input type="number" id="maxparts" value="64" min="2" max="256">
+      </div>
+    </div>
+    <div class="check"><input type="checkbox" id="threaded">
+      <label for="threaded" style="margin:0">真实线程池并行（as_completed 乱序合并）</label></div>
+
+    <button id="run">▶ 一键跑数百次随机顺序</button>
+    <button class="secondary" id="sweep">跑全套对照（所有数据×所有方法，较慢）</button>
+    <div id="spin">运行中，请稍候……</div>
+  </div>
+
+  <!-- 结果区 -->
+  <div>
+    <div class="tabs">
+      <button class="active" data-tab="single">单次试验</button>
+      <button data-tab="sweep">全套对照</button>
+    </div>
+
+    <div id="tab-single">
+      <div class="panel">
+        <h2>十进制真值（60 位 Decimal，不经过 float64）</h2>
+        <div class="truth mono" id="truth">尚未运行</div>
+      </div>
+      <div style="height:14px"></div>
+      <div class="panel">
+        <h2>数百次随机切分/合并的结果</h2>
+        <div class="kpi" id="kpis"></div>
+        <div id="verdict"></div>
+        <label>每次运行结果（按试验序号；红线为十进制真值的最近 float64）</label>
+        <canvas id="chart" height="260"></canvas>
+        <label>出现过的 bit 模式（值 → 次数）</label>
+        <div style="max-height:260px;overflow:auto;margin-top:6px">
+          <table id="patterns"><thead><tr><th>结果值</th><th>出现次数</th>
+            <th>与真值绝对差</th><th>折合 ULP</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="note" id="run-note"></div>
+      </div>
+    </div>
+
+    <div id="tab-sweep" class="hidden">
+      <div class="panel">
+        <h2>全套方法对照（确定性 / 误差 / 速度 / 内存）</h2>
+        <div id="sweep-summary"></div>
+        <div style="max-height:640px;overflow:auto;margin-top:10px">
+          <table id="sweep-table">
+            <thead><tr>
+              <th>数据集</th><th>方法</th><th>类型</th><th>bit模式数</th>
+              <th>逐位相同</th><th>等于真值</th><th>最大绝对误差</th>
+              <th>最大ULP</th><th>耗时(ms)</th><th>相对朴素</th><th>峰值内存(KB)</th><th>守卫/错误</th>
+            </tr></thead><tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
